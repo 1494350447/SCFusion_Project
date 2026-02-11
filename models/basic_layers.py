@@ -44,6 +44,9 @@ class ChannelAttention(nn.Module):
         return x * self.fc(x)
 
 
+
+
+
 def fft_amp_phase(x: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute FFT amplitude and phase per-channel for a real-valued tensor.
 
