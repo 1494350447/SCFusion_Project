@@ -1,12 +1,12 @@
 
 import torch
 import torch.nn as nn
-from .basic_layers import ConvBlock, fft_amp_phase, FrequencySelectiveKernel
+from .basic_layers import ConvBlock, fft_amp_phase, FrequencySelectiveKernel, SpatialChannelAttention
 
 
 class FREFormerBlock(nn.Module):
-    """A single FREFormer-like block combining local conv branch and global
-    frequency-selective branch with residual connection.
+    """Enhanced FREFormer block with spatial-channel cross-frequency attention.
+    Combines local conv branch and global frequency-selective branch with residual connection.
     """
 
     def __init__(self, channels):
@@ -15,24 +15,49 @@ class FREFormerBlock(nn.Module):
             ConvBlock(channels, channels),
             ConvBlock(channels, channels)
         )
-        # small FFN for channel mixing
+
+        # Frequency-selective kernel for both amplitude and phase
+        self.fsk_amp = FrequencySelectiveKernel(channels)
+        self.fsk_phase = FrequencySelectiveKernel(channels)
+
+        # Spatial-channel attention for local features
+        self.sca_local = SpatialChannelAttention(channels)
+
+        # FFN for channel mixing
         self.ffn = nn.Sequential(
-            nn.Conv2d(channels, channels, 1),
+            nn.Conv2d(channels, channels*2, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, 1)
+            nn.Conv2d(channels*2, channels, 1)
         )
-        self.fsk = FrequencySelectiveKernel(channels)
-        # prefer GroupNorm for stability with small batches (paper suggests normalization on transformer branches)
+
+        # Cross-frequency fusion
+        self.freq_fusion = nn.Sequential(
+            nn.Conv2d(channels*2, channels, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 1),
+            nn.Sigmoid()
+        )
+
         self.norm = nn.GroupNorm(1, channels)
 
     def forward(self, x):
-        # local conv path
+        # Local conv path with spatial-channel attention
         loc = self.local(x)
-        # frequency path: compute amplitude and get channel weights
+        loc = self.sca_local(loc)
+
+        # Frequency path: compute amplitude and phase separately
         amp, phase = fft_amp_phase(x)
-        w = self.fsk(amp)
-        glob = x * (1.0 + w)
-        out = loc + glob
+        w_amp = self.fsk_amp(amp)
+        w_phase = self.fsk_phase(amp)  # Use amplitude to guide phase
+
+        # Cross-frequency guided feature
+        freq_feat = x * (1.0 + w_amp) + x * w_phase
+
+        # Fuse local and frequency features
+        fusion_weight = self.freq_fusion(torch.cat([loc, freq_feat], dim=1))
+        out = loc * fusion_weight + freq_feat * (1.0 - fusion_weight)
+
+        # FFN and residual
         out = out + self.ffn(out)
         out = self.norm(out)
         return out

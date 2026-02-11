@@ -1,15 +1,16 @@
 import torch
 import torch.nn as nn
-from .basic_layers import ConvBlock, high_frequency_mask, LearnableHighPass
+from .basic_layers import ConvBlock, high_frequency_mask, LearnableHighPass, SpatialChannelAttention
 
 
 class DecoderBlock(nn.Module):
-    """Upsample + conv block with optional skip connection."""
+    """Upsample + conv block with optional skip connection and spatial-channel attention."""
 
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.conv = nn.Sequential(ConvBlock(in_ch, out_ch), ConvBlock(out_ch, out_ch))
+        self.sca = SpatialChannelAttention(out_ch)
 
     def forward(self, x, skip=None):
         x = self.up(x)
@@ -18,25 +19,43 @@ class DecoderBlock(nn.Module):
             if x.shape[-2:] != skip.shape[-2:]:
                 x = nn.functional.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
             x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
+        x = self.conv(x)
+        x = self.sca(x)
+        return x
 
 
 class FRGM(nn.Module):
-    """Frequency Reconstruction-Guided Module: emphasizes high-frequency details."""
+    """Frequency Reconstruction-Guided Module: emphasizes high-frequency details
+    with spatial-channel attention for better feature refinement.
+    """
 
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.conv1 = ConvBlock(in_ch, out_ch)
         self.conv2 = ConvBlock(out_ch, out_ch)
-        self.att = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(out_ch, out_ch, 1), nn.Sigmoid())
+        self.sca = SpatialChannelAttention(out_ch)
         self.hpf = LearnableHighPass(out_ch)
 
+        # Frequency-aware refinement
+        self.freq_refine = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 1),
+            nn.Sigmoid()
+        )
+
     def forward(self, x):
-        # apply learnable high-pass to emphasize edges
+        # Apply learnable high-pass to emphasize edges
         x_hf = self.hpf(x)
         x = self.conv1(x + x_hf)
         x = self.conv2(x)
-        x = x * self.att(x)
+
+        # Spatial-channel attention
+        x = self.sca(x)
+
+        # Frequency-aware refinement
+        freq_weight = self.freq_refine(x)
+        x = x * (1.0 + freq_weight)
         return x
 
 
