@@ -1,237 +1,142 @@
-
 import torch
 import torch.nn as nn
-from .basic_layers import ConvBlock, fft_amp_phase, FrequencySelectiveKernel, SpatialChannelAttention
+
+
+class LayerNorm2d(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        return x.permute(0, 3, 1, 2)
 
 
 class LearnableSelectiveFilterGenerator(nn.Module):
-    """Learnable Selective Filter Generator (LSFG) - Core of FREFormer.
-
-    Implements the dynamic filter generation mechanism described in the paper:
-    1. Global semantic capture: E(X) = Σ(X_i,j) / (H*W)
-    2. Filter generation: G(E(X)) = Σ(E(X)_i,j / Σ E(X)_i,j)
-    3. Dynamic modulation: F(Y_i) = G(MLP(Softmax(Y_i)))
-    """
-
-    def __init__(self, channels, reduction=4):
+    def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
-        mid_channels = max(channels // reduction, 8)
-
-        # Global average pooling for semantic capture E(X)
+        mid = max(channels // reduction, 8)
         self.global_pool = nn.AdaptiveAvgPool2d(1)
-
-        # Generator network G(E(X)) with normalization
         self.generator = nn.Sequential(
-            nn.Conv2d(channels, mid_channels, 1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, channels, 1, bias=False),
-            nn.BatchNorm2d(channels)
+            nn.Conv2d(channels, mid, 1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(mid, channels, 1, bias=False),
         )
-
-        # Softmax for filter weight normalization
-        self.softmax = nn.Softmax(dim=1)
-
-        # MLP for instance-specific feature transformation
-        self.mlp = nn.Sequential(
-            nn.Conv2d(channels, mid_channels, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, channels, 1)
+        self.instance_mlp = nn.Sequential(
+            nn.Conv2d(channels, mid, 1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(mid, channels, 1, bias=False),
         )
+        self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x):
-        """
-        Args:
-            x: Input features (B, C, H, W)
-        Returns:
-            filter_weights: Dynamic filter weights (B, C, H, W)
-        """
-        B, C, H, W = x.shape
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        global_desc = self.global_pool(x)
+        base_weight = self.generator(global_desc)
 
-        # Step 1: Global semantic capture E(X)
-        global_context = self.global_pool(x)  # (B, C, 1, 1)
+        instance_weight = self.instance_mlp(x).view(b, c, -1)
+        instance_weight = self.softmax(instance_weight).view(b, c, h, w)
 
-        # Step 2: Generate base filter weights G(E(X))
-        base_weights = self.generator(global_context)  # (B, C, 1, 1)
+        return 1.0 + base_weight * instance_weight
 
-        # Step 3: Instance-aware processing
-        # Apply MLP and Softmax to input features
-        instance_features = self.mlp(x)  # (B, C, H, W)
 
-        # Normalize across spatial dimensions for each channel
-        B, C, H, W = instance_features.shape
-        instance_features_flat = instance_features.view(B, C, -1)  # (B, C, H*W)
-        normalized_features = self.softmax(instance_features_flat)  # (B, C, H*W)
-        normalized_features = normalized_features.view(B, C, H, W)  # (B, C, H, W)
+class LearnableSelectiveFilter(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.lsfg = LearnableSelectiveFilterGenerator(channels)
 
-        # Step 4: Combine base weights with instance-specific features
-        filter_weights = base_weights * (1.0 + normalized_features)
-
-        return filter_weights
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        filt = self.lsfg(x)
+        xf = torch.fft.fft2(x, norm='ortho')
+        ff = torch.fft.fft2(filt, norm='ortho')
+        out = torch.fft.ifft2(xf * ff, norm='ortho').real
+        return out
 
 
 class FREFormerBlock(nn.Module):
-    """Enhanced FREFormer block implementing the paper's architecture.
-
-    Combines:
-    1. Learnable Selective Filter Generator (LSFG) for dynamic frequency filtering
-    2. 2D FFT/IFFT for frequency domain processing
-    3. Channel MLP for inter-channel feature mixing
-    4. Residual connections with normalization
-    """
-
-    def __init__(self, channels):
+    def __init__(self, channels: int, mlp_ratio: int = 4):
         super().__init__()
-
-        # Normalization layers
-        self.norm1 = nn.LayerNorm([channels])
-        self.norm2 = nn.LayerNorm([channels])
-
-        # Learnable Selective Filter Generator (LSFG)
-        self.lsfg = LearnableSelectiveFilterGenerator(channels)
-
-        # Channel MLP for feature mixing (as described in paper)
+        self.norm1 = LayerNorm2d(channels)
+        self.lsf = LearnableSelectiveFilter(channels)
+        self.norm2 = LayerNorm2d(channels)
+        hidden = channels * mlp_ratio
         self.channel_mlp = nn.Sequential(
-            nn.Conv2d(channels, channels * 4, 1),
+            nn.Conv2d(channels, hidden, 1),
             nn.GELU(),
-            nn.Conv2d(channels * 4, channels, 1)
+            nn.Conv2d(hidden, channels, 1),
         )
 
-    def forward(self, x):
-        """
-        Args:
-            x: Input features (B, C, H, W)
-        Returns:
-            out: Processed features (B, C, H, W)
-        """
-        identity = x
-        B, C, H, W = x.shape
-
-        # Apply first normalization
-        x_norm = x.permute(0, 2, 3, 1)  # (B, H, W, C)
-        x_norm = self.norm1(x_norm)
-        x_norm = x_norm.permute(0, 3, 1, 2)  # (B, C, H, W)
-
-        # Step 1: Transform to frequency domain via 2D FFT
-        x_fft = torch.fft.rfft2(x_norm, norm='ortho')  # (B, C, H, W//2+1) complex
-
-        # Step 2: Generate dynamic filter weights using LSFG
-        filter_weights = self.lsfg(x_norm)  # (B, C, H, W)
-
-        # Adapt filter weights to match FFT output size
-        filter_weights_fft = torch.fft.rfft2(filter_weights, norm='ortho')  # Complex weights
-
-        # Step 3: Apply dynamic filtering in frequency domain (element-wise multiplication)
-        x_filtered = x_fft * filter_weights_fft
-
-        # Step 4: Transform back to spatial domain via 2D IFFT
-        x_spatial = torch.fft.irfft2(x_filtered, s=(H, W), norm='ortho')  # (B, C, H, W)
-
-        # Residual connection
-        x = identity + x_spatial
-
-        # Step 5: Channel MLP with second normalization
-        x_norm2 = x.permute(0, 2, 3, 1)  # (B, H, W, C)
-        x_norm2 = self.norm2(x_norm2)
-        x_norm2 = x_norm2.permute(0, 3, 1, 2)  # (B, C, H, W)
-
-        x = x + self.channel_mlp(x_norm2)
-
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fa = x + self.lsf(self.norm1(x))
+        fb = fa + self.channel_mlp(self.norm2(fa))
+        return fb
 
 
 class DownsamplingLayer(nn.Module):
-    """Downsampling layer as described in paper: LN -> Conv2d -> LN
-
-    Equation (1): Y_i = LN(Conv2d(LN(X_i)))
-    """
-
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.norm1 = nn.LayerNorm([in_channels])
+        self.norm1 = LayerNorm2d(in_channels)
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, bias=False)
-        self.norm2 = nn.LayerNorm([out_channels])
+        self.norm2 = LayerNorm2d(out_channels)
 
-    def forward(self, x):
-        B, C, H, W = x.shape
-        # First normalization
-        x = x.permute(0, 2, 3, 1)  # (B, H, W, C)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.norm1(x)
-        x = x.permute(0, 3, 1, 2)  # (B, C, H, W)
-
-        # Convolution
         x = self.conv(x)
-
-        # Second normalization
-        B, C, H, W = x.shape
-        x = x.permute(0, 2, 3, 1)  # (B, H, W, C)
         x = self.norm2(x)
-        x = x.permute(0, 3, 1, 2)  # (B, C, H, W)
-
         return x
 
 
-class FREFormerEncoder(nn.Module):
-    """FREFormer Encoder implementing the paper's hierarchical architecture.
-
-    Architecture:
-    - Two-stage hierarchical structure
-    - Each stage: Downsampling Layer + FREFormer Blocks (×4)
-    - Combines local inductive bias (conv) and global receptive field (FFT)
-    """
-
-    def __init__(self, in_ch=3, base_ch=32, num_blocks=4):
+class FREFormerStem(nn.Module):
+    def __init__(self, in_ch: int, base_ch: int):
         super().__init__()
-
-        # Initial stem with convolution for local inductive bias
-        self.stem = nn.Sequential(
+        self.proj = nn.Sequential(
             nn.Conv2d(in_ch, base_ch, kernel_size=7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(base_ch),
-            nn.ReLU(inplace=True)
+            nn.GELU(),
         )
 
-        # Stage 0: base_ch channels
-        self.down0 = DownsamplingLayer(base_ch, base_ch)
-        self.blocks0 = nn.ModuleList([
-            FREFormerBlock(base_ch) for _ in range(num_blocks)
-        ])
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
 
-        # Stage 1: base_ch*2 channels
-        self.down1 = DownsamplingLayer(base_ch, base_ch * 2)
-        self.blocks1 = nn.ModuleList([
-            FREFormerBlock(base_ch * 2) for _ in range(num_blocks)
-        ])
 
-        # Stage 2: base_ch*4 channels
-        self.down2 = DownsamplingLayer(base_ch * 2, base_ch * 4)
-        self.blocks2 = nn.ModuleList([
-            FREFormerBlock(base_ch * 4) for _ in range(num_blocks)
-        ])
+class FREFormerBackbone(nn.Module):
+    def __init__(self, base_ch: int = 32, num_blocks_per_stage=(2, 2, 2, 2)):
+        super().__init__()
+        c0 = base_ch
+        c1 = base_ch * 2
+        c2 = base_ch * 4
+        c3 = base_ch * 8
+        channels = [c0, c1, c2, c3]
 
-    def forward(self, x):
-        """
-        Args:
-            x: Input image (B, C, H, W)
-        Returns:
-            List of multi-scale features [f0, f1, f2]
-        """
-        # Stem
-        x = self.stem(x)  # (B, base_ch, H/2, W/2)
+        in_channels = [base_ch, c0, c1, c2]
+        self.downsamples = nn.ModuleList(
+            [DownsamplingLayer(in_c, out_c) for in_c, out_c in zip(in_channels, channels)]
+        )
+        self.blocks = nn.ModuleList(
+            [
+                nn.Sequential(*[FREFormerBlock(channels[idx]) for _ in range(num_blocks_per_stage[idx])])
+                for idx in range(4)
+            ]
+        )
 
-        # Stage 0
-        f0 = self.down0(x)  # (B, base_ch, H/4, W/4)
-        for block in self.blocks0:
-            f0 = block(f0)
+    def forward(self, x: torch.Tensor):
+        feats = []
+        for down, stage_blocks in zip(self.downsamples, self.blocks):
+            x = down(x)
+            x = stage_blocks(x)
+            feats.append(x)
+        return feats
 
-        # Stage 1
-        f1 = self.down1(f0)  # (B, base_ch*2, H/8, W/8)
-        for block in self.blocks1:
-            f1 = block(f1)
 
-        # Stage 2
-        f2 = self.down2(f1)  # (B, base_ch*4, H/16, W/16)
-        for block in self.blocks2:
-            f2 = block(f2)
+class FREFormerEncoder(nn.Module):
+    def __init__(self, in_ch=3, base_ch=32, num_blocks_per_stage=(2, 2, 2, 2)):
+        super().__init__()
+        self.stem = FREFormerStem(in_ch, base_ch)
+        self.backbone = FREFormerBackbone(base_ch=base_ch, num_blocks_per_stage=num_blocks_per_stage)
 
-        return [f0, f1, f2]
+    def forward(self, x: torch.Tensor):
+        x = self.stem(x)
+        return self.backbone(x)
 

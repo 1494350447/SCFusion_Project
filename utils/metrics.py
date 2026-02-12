@@ -3,7 +3,11 @@ import numpy as np
 
 
 def mae(pred, gt):
-    return torch.abs(pred - gt).mean().item()
+    if isinstance(pred, np.ndarray):
+        pred = torch.from_numpy(pred)
+    if isinstance(gt, np.ndarray):
+        gt = torch.from_numpy(gt)
+    return torch.abs(pred.float() - gt.float()).mean().item()
 
 
 def precision_recall_fmeasure(pred, gt, thresholds=None, eps=1e-7):

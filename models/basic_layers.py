@@ -1,26 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+from typing import List, Tuple
 
 
 class ConvBlock(nn.Module):
     def __init__(self, in_c: int, out_c: int, k: int = 3, s: int = 1, p: int = 1, norm: str = 'gn'):
-        """Convolution -> Norm -> ReLU block.
-
-        Args:
-            in_c, out_c: channel dims
-            k,s,p: conv params
-            norm: 'bn' for BatchNorm2d, 'gn' for GroupNorm (default), 'none' for no norm
-        """
         super().__init__()
         layers = [nn.Conv2d(in_c, out_c, k, s, p, bias=False)]
         if norm == 'bn':
             layers.append(nn.BatchNorm2d(out_c))
         elif norm == 'gn':
-            # GroupNorm with 1 group ~ InstanceNorm across channels and spatial dims
             layers.append(nn.GroupNorm(1, out_c))
-        # else: no norm
         layers.append(nn.ReLU(inplace=True))
         self.conv = nn.Sequential(*layers)
 
@@ -37,7 +28,7 @@ class ChannelAttention(nn.Module):
         self.fc = nn.Sequential(
             nn.Conv2d(channels, mid, 1, bias=False),
             nn.ReLU(inplace=True),
-            nn.Conv2d(mid, channels, 1, bias=False)
+            nn.Conv2d(mid, channels, 1, bias=False),
         )
         self.sigmoid = nn.Sigmoid()
 
@@ -50,7 +41,7 @@ class ChannelAttention(nn.Module):
 class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
@@ -61,156 +52,132 @@ class SpatialAttention(nn.Module):
 
 
 class SpatialChannelAttention(nn.Module):
-    """Combined Spatial-Channel Attention for SCFusion"""
     def __init__(self, channels, reduction=8, kernel_size=7):
         super().__init__()
         self.ca = ChannelAttention(channels, reduction)
         self.sa = SpatialAttention(kernel_size)
 
     def forward(self, x):
-        x = self.ca(x)
-        x = self.sa(x)
-        return x
-
-
-
+        return self.sa(self.ca(x))
 
 
 def fft_amp_phase(x: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute FFT amplitude and phase per-channel for a real-valued tensor.
-
-    Args:
-        x: input tensor of shape (B, C, H, W)
-        eps: small value to stabilize amplitude computations
-
-    Returns:
-        amp: amplitude maps (B, C, H, W)
-        phase: phase maps in radians (B, C, H, W)
-    """
-    # operate per-channel
-    Xf = torch.fft.fft2(x, norm='ortho')
-    amp = torch.abs(Xf)
-    # stabilize amplitude for downstream normalization
-    amp = amp.clamp(min=eps)
-    phase = torch.angle(Xf)
+    xf = torch.fft.fft2(x, norm='ortho')
+    amp = torch.abs(xf).clamp(min=eps)
+    phase = torch.angle(xf)
     return amp, phase
 
 
-def ifft_from_amp_phase(amp, phase):
-    """Reconstruct approximate spatial map from amplitude and phase (inverse FFT)."""
+def ifft_from_amp_phase(amp: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
     real = amp * torch.cos(phase)
     imag = amp * torch.sin(phase)
     comp = torch.complex(real, imag)
-    x = torch.fft.ifft2(comp, norm='ortho')
-    # return real part
-    return x.real
+    out = torch.fft.ifft2(comp, norm='ortho')
+    return out.real
 
 
-def high_frequency_mask(x, ratio=0.25):
-    """Generate a simple high-frequency emphasis mask in frequency domain.
-    ratio: fraction of high-frequency radius to keep.
-    """
-    B, C, H, W = x.shape
-    yf = torch.fft.fft2(x, norm='ortho')
-    # create frequency grid
-    fy = torch.fft.fftshift(yf, dim=(-2, -1))
-    # compute radial distance map
-    yy, xx = torch.meshgrid(torch.linspace(-1,1,H, device=x.device), torch.linspace(-1,1,W, device=x.device), indexing='ij')
-    r = torch.sqrt(xx**2 + yy**2)
-    mask = (r >= (1.0 - ratio)).float()
-    mask = mask.unsqueeze(0).unsqueeze(0)
-    mask = mask.repeat(B, C, 1, 1)
-    return mask
+def channel_fft_amp_phase(x: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    xf = torch.fft.fft(x, dim=1, norm='ortho')
+    amp = torch.abs(xf).clamp(min=eps)
+    phase = torch.angle(xf)
+    return amp, phase
+
+
+def ichannel_from_amp_phase(amp: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+    real = amp * torch.cos(phase)
+    imag = amp * torch.sin(phase)
+    comp = torch.complex(real, imag)
+    out = torch.fft.ifft(comp, dim=1, norm='ortho')
+    return out.real
+
+
+def high_frequency_mask(x: torch.Tensor, ratio: float = 0.25):
+    b, c, h, w = x.shape
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, h, device=x.device),
+        torch.linspace(-1, 1, w, device=x.device),
+        indexing='ij',
+    )
+    rr = torch.sqrt(xx ** 2 + yy ** 2)
+    mask = (rr >= (1.0 - ratio)).float().unsqueeze(0).unsqueeze(0)
+    return mask.repeat(b, c, 1, 1)
+
+
+def build_radial_band_masks(
+    height: int,
+    width: int,
+    num_bands: int = 4,
+    device: torch.device | None = None,
+) -> List[torch.Tensor]:
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, height, device=device),
+        torch.linspace(-1.0, 1.0, width, device=device),
+        indexing='ij',
+    )
+    rr = torch.sqrt(xx ** 2 + yy ** 2)
+    rr = rr / (rr.max() + 1e-6)
+
+    boundaries = torch.linspace(0.0, 1.0, num_bands + 1, device=device)
+    masks: List[torch.Tensor] = []
+    for idx in range(num_bands):
+        low = boundaries[idx]
+        high = boundaries[idx + 1]
+        if idx == num_bands - 1:
+            mask = ((rr >= low) & (rr <= high)).float()
+        else:
+            mask = ((rr >= low) & (rr < high)).float()
+        masks.append(mask.unsqueeze(0).unsqueeze(0))
+    return masks
 
 
 def amp_normalize(amp: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Per-channel amplitude normalization to stabilize learning.
-
-    amp: (B,C,H,W)
-    returns normalized amp with same shape
-    """
     mean = amp.mean(dim=(-2, -1), keepdim=True)
     std = amp.std(dim=(-2, -1), keepdim=True)
     return (amp - mean) / (std + eps)
 
 
 def phase_to_unitvec(phase: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert phase map to sin/cos representation to avoid wrap issues.
-
-    phase: (B,C,H,W) -> returns (sin, cos)
-    """
     return torch.sin(phase), torch.cos(phase)
 
 
 def unitvec_to_phase(sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
-    """Recover phase from sin/cos components using atan2.
-
-    returns phase in radians with shape (B,C,H,W)
-    """
-    return torch.atan2(sin, cos)
+    sin_norm = sin / (torch.sqrt(sin ** 2 + cos ** 2 + 1e-6))
+    cos_norm = cos / (torch.sqrt(sin ** 2 + cos ** 2 + 1e-6))
+    return torch.atan2(sin_norm, cos_norm)
 
 
 def spectral_pool(amp: torch.Tensor, mode: str = 'avg') -> torch.Tensor:
-    """Pool amplitude in frequency domain to a compact descriptor (B,C,1,1).
-
-    mode: 'avg' or 'max'
-    """
     if mode == 'avg':
         return amp.mean(dim=(-2, -1), keepdim=True)
-    else:
-        return amp.amax(dim=(-2, -1), keepdim=True)
+    return amp.amax(dim=(-2, -1), keepdim=True)
 
 
 class FrequencySelectiveKernel(nn.Module):
-    """A small learnable module that computes channel-wise frequency weights
-    from amplitude maps. It produces a (B,C,1,1) scaling tensor to modulate
-    spatial features or amplitude maps.
-    """
-
     def __init__(self, channels, hidden=64):
         super().__init__()
         mid = max(8, min(hidden, channels))
-        self.pool = nn.AdaptiveAvgPool2d(1)
         self.net = nn.Sequential(
             nn.Conv2d(channels, mid, 1),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid, channels, 1),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
 
     def forward(self, amp):
-        # amp: (B,C,H,W) -> produce (B,C,1,1)
-        # prefer spectral pooling when spatial dims are meaningful
-        B, C, H, W = amp.shape
-        if H > 1 and W > 1:
-            x = spectral_pool(amp, mode='avg')
-        else:
-            x = self.pool(amp)
-        w = self.net(x)
-        return w
+        pooled = spectral_pool(amp, mode='avg')
+        return self.net(pooled)
 
 
 class LearnableHighPass(nn.Module):
-    """Depthwise learnable high-pass filter implemented as residual of a
-    depthwise blur (low-pass) conv. The blur kernel is initialized to a
-    simple Gaussian-like kernel but is learnable.
-    """
-
     def __init__(self, channels):
         super().__init__()
-        self.channels = channels
         self.blur = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
-        # initialize with simple blur kernel
-        kernel = torch.tensor([[1., 2., 1.], [2., 4., 2.], [1., 2., 1.]])
+        kernel = torch.tensor([[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]])
         kernel = kernel / kernel.sum()
-        # assign to each channel
         with torch.no_grad():
-            k = kernel.unsqueeze(0).unsqueeze(0)
-            k = k.repeat(channels, 1, 1, 1)
-            self.blur.weight.copy_(k)
+            weight = kernel.unsqueeze(0).unsqueeze(0).repeat(channels, 1, 1, 1)
+            self.blur.weight.copy_(weight)
 
     def forward(self, x):
-        # lowpass then subtract to get high frequency
-        low = self.blur(x)
-        return x - low
+        return x - self.blur(x)
 

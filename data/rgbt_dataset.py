@@ -47,16 +47,18 @@ class RGBT_Dataset(Dataset):
 
     def __getitem__(self, idx):
         ir_path, vis_path, mask_path = self.samples[idx]
-        ir = Image.open(ir_path).convert('RGB')
+        ir = Image.open(ir_path).convert('L')
         vis = Image.open(vis_path).convert('RGB')
-        mask = Image.open(mask_path).convert('L') if mask_path else None
+        has_mask = mask_path is not None
+        mask = Image.open(mask_path).convert('L') if has_mask else None
         if self.transform:
             res = self.transform(ir, vis, mask) if mask is not None else self.transform(ir, vis)
             if mask is not None:
                 ir_t, vis_t, mask_t = res
-                return {'ir': ir_t, 'vis': vis_t, 'mask': mask_t}
+                return {'ir': ir_t, 'vis': vis_t, 'mask': mask_t, 'has_mask': True}
             else:
                 ir_t, vis_t = res
-                return {'ir': ir_t, 'vis': vis_t, 'mask': None}
-        return {'ir': ir, 'vis': vis, 'mask': mask}
+                mask_t = ir_t.new_zeros((1, ir_t.shape[1], ir_t.shape[2]))
+                return {'ir': ir_t, 'vis': vis_t, 'mask': mask_t, 'has_mask': False}
+        return {'ir': ir, 'vis': vis, 'mask': mask, 'has_mask': has_mask}
 

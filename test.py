@@ -28,7 +28,8 @@ def main():
     transforms = __import__('data.transforms', fromlist=['build_transforms']).build_transforms(cfg['input_size'], is_train=False)
     dataset = __import__('data.rgbt_dataset', fromlist=['RGBT_Dataset']).RGBT_Dataset(cfg['dataset_root'], transform=transforms, split='test')
     loader = DataLoader(dataset, batch_size=1)
-    net = __import__('models', fromlist=['SCFusion']).SCFusion().to(cfg.get('device','cpu'))
+    model_cfg = cfg.get('model', {})
+    net = __import__('models', fromlist=['SCFusion']).SCFusion(**model_cfg).to(cfg.get('device','cpu'))
     ck = torch.load(args.ckpt, map_location=cfg.get('device','cpu'))
     net.load_state_dict(ck['state_dict'])
     os.makedirs(args.save_dir, exist_ok=True)
@@ -39,16 +40,28 @@ def main():
             ir = batch['ir'].to(cfg.get('device','cpu'))
             vis = batch['vis'].to(cfg.get('device','cpu'))
             mask = batch.get('mask')
+            has_mask = batch.get('has_mask')
             out = net(ir, vis)
+            if isinstance(out, (tuple, list)):
+                out = out[0]
             out_sig = torch.sigmoid(out)
             save_map(out_sig.cpu(), os.path.join(args.save_dir, f'pred_{i:04d}.png'))
-            if mask is not None:
-                m = mask.cpu().numpy()[0]
-                p = out_sig.cpu().numpy()[0,0]
+            has_gt = False
+            if has_mask is not None:
+                if torch.is_tensor(has_mask):
+                    has_gt = bool(has_mask.any().item())
+                else:
+                    has_gt = bool(has_mask)
+            elif mask is not None:
+                has_gt = True
+
+            if has_gt and mask is not None:
+                m = mask.cpu().numpy()[0, 0]
+                p = out_sig.cpu().numpy()[0, 0]
                 metrics['mae'].append(mae(p, m))
-                f,_,_ = precision_recall_fmeasure((p*255).astype('uint8'), (m*255).astype('uint8'))
+                f,_,_ = precision_recall_fmeasure(p, m)
                 metrics['f'].append(f)
-                metrics['em'].append(em_score((p*255).astype('uint8'), (m*255).astype('uint8')))
+                metrics['em'].append(em_score(p, m))
             # save overlay on first few
             if i < 10:
                 # try to get original RGB for overlay: use vis input (denormalize)

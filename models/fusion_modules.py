@@ -1,270 +1,161 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 from .basic_layers import (
-    ConvBlock,
-    ChannelAttention,
-    SpatialAttention,
     SpatialChannelAttention,
-    fft_amp_phase,
-    ifft_from_amp_phase,
-    FrequencySelectiveKernel,
     amp_normalize,
-    phase_to_unitvec,
-    unitvec_to_phase,
+    channel_fft_amp_phase,
+    fft_amp_phase,
+    ichannel_from_amp_phase,
+    ifft_from_amp_phase,
 )
 
 
-class HFRB(nn.Module):
-    """Homogeneous Frequency Refined Block (HFRB).
-
-    Processes features from the same modality to refine frequency components
-    while maintaining modality-specific characteristics.
-
-    Key operations:
-    1. Frequency domain transformation
-    2. Selective frequency refinement
-    3. Spatial-channel attention for feature enhancement
-    """
-
-    def __init__(self, channels):
+class CLC(nn.Module):
+    def __init__(self, channels: int):
         super().__init__()
-
-        # Frequency refinement path
-        self.freq_refine = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, groups=channels),  # Depthwise
-            nn.Conv2d(channels, channels, 1),  # Pointwise
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(channels, channels, 1),
         )
 
-        # Spatial-channel attention for refined features
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class CBS(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class HFRB(nn.Module):
+    def __init__(self, channels: int, groups: int = 4):
+        super().__init__()
+        self.channels = channels
+        self.groups = max(1, min(groups, channels))
+
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.global_fc = nn.Sequential(
+            nn.Conv2d(channels, channels, 1),
+            nn.Sigmoid(),
+        )
+
+        self.local_fc = nn.Linear(channels, channels)
+        self.local_conv1d = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
+        self.local_sigmoid = nn.Sigmoid()
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
         self.sca = SpatialChannelAttention(channels)
 
-        # Frequency selective kernel for dynamic weighting
-        self.fsk = FrequencySelectiveKernel(channels)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.shape
+        global_weight = self.global_fc(self.global_pool(x))
 
-        # Output projection
-        self.out_proj = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 1),
-            nn.BatchNorm2d(channels)
-        )
+        pooled = self.global_pool(x).view(b, c)
+        local_weight = self.local_fc(pooled).unsqueeze(1)
+        local_weight = self.local_conv1d(local_weight).squeeze(1).view(b, c, 1, 1)
+        local_weight = self.local_sigmoid(local_weight)
 
-    def forward(self, x):
-        """
-        Args:
-            x: Input features from single modality (B, C, H, W)
-        Returns:
-            Refined features (B, C, H, W)
-        """
-        identity = x
+        split_size = c // self.groups
+        remainder = c % self.groups
+        start = 0
+        grouped_features = []
+        for idx in range(self.groups):
+            part = split_size + (1 if idx < remainder else 0)
+            end = start + part
+            xg = x[:, start:end]
+            wg = global_weight[:, start:end]
+            lg = local_weight[:, start:end]
+            grouped_features.append(xg * wg * (1.0 + lg))
+            start = end
 
-        # Extract frequency components
-        amp, phase = fft_amp_phase(x)
-
-        # Generate frequency-selective weights
-        freq_weights = self.fsk(amp)  # (B, C, 1, 1)
-
-        # Apply frequency-aware modulation
-        x_freq_weighted = x * (1.0 + freq_weights)
-
-        # Refine features
-        x_refined = self.freq_refine(x_freq_weighted)
-
-        # Apply spatial-channel attention
-        x_attended = self.sca(x_refined)
-
-        # Combine original and refined features
-        x_combined = torch.cat([identity, x_attended], dim=1)
-        out = self.out_proj(x_combined)
-
-        return out
+        grouped_feature = torch.cat(grouped_features, dim=1)
+        out = self.fuse(torch.cat([x, grouped_feature], dim=1))
+        return self.sca(out)
 
 
-class HSCFFB(nn.Module):
-    """Heterogeneous Spatial-Channel Frequency Fusion Block (HSCFFB).
-
-    Fuses features from different modalities (IR and Visible) using:
-    1. Spatial alignment across modalities
-    2. Channel-wise fusion of complementary information
-    3. Frequency-guided cross-modal interaction
-
-    This implements the core cross-modal fusion mechanism described in the paper.
-    """
-
-    def __init__(self, channels):
+class HSFB(nn.Module):
+    def __init__(self, channels: int):
         super().__init__()
+        self.proj_ir = CBS(channels)
+        self.proj_vis = CBS(channels)
 
-        # Frequency selective kernels for each modality
-        self.fsk_a = FrequencySelectiveKernel(channels)
-        self.fsk_b = FrequencySelectiveKernel(channels)
+        self.amp_clc = CLC(channels)
+        self.phase_clc = CLC(channels)
 
-        # Cross-modal attention for amplitude fusion
-        self.cross_modal_attn = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 1),
+        self.branch_refine = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels * 2, 1),
-            nn.Sigmoid()
+            nn.GELU(),
         )
 
-        # Amplitude fusion with spatial-channel attention
-        self.amp_fusion = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 3, padding=1),
+        self.final = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
             nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
-        self.amp_sca = SpatialChannelAttention(channels)
-
-        # Phase fusion network (processes sin/cos representation)
-        self.phase_fusion = nn.Sequential(
-            nn.Conv2d(channels * 4, channels * 2, 3, padding=1),
-            nn.BatchNorm2d(channels * 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels * 2, channels * 2, 1)
+            nn.GELU(),
         )
 
-        # Spatial alignment module
-        self.spatial_align = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 3, padding=1),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
+    def _branch_forward(self, x: torch.Tensor) -> torch.Tensor:
+        amp_sp, phase_sp = fft_amp_phase(x)
+        amp_ch, phase_ch = channel_fft_amp_phase(amp_sp)
 
-        # Final fusion with residual connection
-        self.final_fusion = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 1),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
+        amp_ch = self.amp_clc(amp_ch)
+        phase_ch = self.phase_clc(phase_ch)
 
-    def forward(self, feat_a, feat_b):
-        """
-        Args:
-            feat_a: Features from modality A (e.g., IR) (B, C, H, W)
-            feat_b: Features from modality B (e.g., Visible) (B, C, H, W)
-        Returns:
-            Fused features (B, C, H, W)
-        """
-        # Step 1: Extract frequency components for both modalities
-        amp_a, phase_a = fft_amp_phase(feat_a)
-        amp_b, phase_b = fft_amp_phase(feat_b)
+        amp_refined = ichannel_from_amp_phase(amp_ch, phase_ch).abs()
+        out = ifft_from_amp_phase(amp_refined, phase_sp)
+        return self.branch_refine(out)
 
-        # Step 2: Generate modality-specific frequency weights
-        weight_a = self.fsk_a(amp_a)  # (B, C, 1, 1)
-        weight_b = self.fsk_b(amp_b)  # (B, C, 1, 1)
+    def forward(self, feat_ir: torch.Tensor, feat_vis: torch.Tensor) -> torch.Tensor:
+        feat_ir = self.proj_ir(feat_ir)
+        feat_vis = self.proj_vis(feat_vis)
 
-        # Step 3: Normalize and weight amplitudes
-        amp_a_norm = amp_normalize(amp_a) * weight_a
-        amp_b_norm = amp_normalize(amp_b) * weight_b
+        ir_branch = self._branch_forward(feat_ir)
+        vis_branch = self._branch_forward(feat_vis)
 
-        # Step 4: Cross-modal attention for amplitude
-        amp_concat = torch.cat([amp_a_norm, amp_b_norm], dim=1)
-        cross_weights = self.cross_modal_attn(amp_concat)  # (B, C*2, H, W)
-        weight_a_cross, weight_b_cross = cross_weights.chunk(2, dim=1)
-
-        # Apply cross-modal weights
-        amp_a_weighted = amp_a_norm * weight_a_cross
-        amp_b_weighted = amp_b_norm * weight_b_cross
-
-        # Step 5: Fuse amplitudes with spatial-channel attention
-        amp_fused_input = torch.cat([amp_a_weighted, amp_b_weighted], dim=1)
-        amp_fused = self.amp_fusion(amp_fused_input)
-        amp_fused = self.amp_sca(amp_fused)
-
-        # Step 6: Phase fusion using sin/cos representation
-        phase_a_sin, phase_a_cos = phase_to_unitvec(phase_a)
-        phase_b_sin, phase_b_cos = phase_to_unitvec(phase_b)
-
-        phase_concat = torch.cat([
-            phase_a_sin, phase_a_cos,
-            phase_b_sin, phase_b_cos
-        ], dim=1)
-
-        phase_fused_vec = self.phase_fusion(phase_concat)  # (B, C*2, H, W)
-        phase_fused_sin, phase_fused_cos = phase_fused_vec.chunk(2, dim=1)
-        phase_fused = unitvec_to_phase(phase_fused_sin, phase_fused_cos)
-
-        # Step 7: Reconstruct spatial features from fused frequency components
-        feat_reconstructed = ifft_from_amp_phase(amp_fused, phase_fused)
-
-        # Step 8: Spatial alignment with original features
-        spatial_input = torch.cat([feat_a, feat_b], dim=1)
-        feat_aligned = self.spatial_align(spatial_input)
-
-        # Step 9: Final fusion
-        final_input = torch.cat([feat_reconstructed, feat_aligned], dim=1)
-        out = self.final_fusion(final_input)
-
-        return out
+        return self.final(ir_branch + vis_branch)
 
 
 class CFGIM(nn.Module):
-    """Cross-Frequency Guided Interaction Module (CFGIM).
-
-    Combines HFRB and HSCFFB to perform comprehensive cross-modal fusion:
-    1. Refine each modality's features independently (HFRB)
-    2. Fuse refined features across modalities (HSCFFB)
-    3. Apply frequency-guided enhancement
-    4. Final spatial-channel refinement
-
-    This is the main fusion module used at each scale in the SCFusion network.
-    """
-
-    def __init__(self, channels):
+    def __init__(self, channels: int):
         super().__init__()
+        self.hfrb_ir = HFRB(channels)
+        self.hfrb_vis = HFRB(channels)
+        self.hsfb = HSFB(channels)
 
-        # Homogeneous refinement for each modality
-        self.hfrb_a = HFRB(channels)
-        self.hfrb_b = HFRB(channels)
-
-        # Heterogeneous fusion across modalities
-        self.hscffb = HSCFFB(channels)
-
-        # Cross-frequency guidance module
-        self.freq_guidance = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 1),
+        self.cross_gate = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 1, bias=False),
             nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Conv2d(channels, channels, 1),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
-
-        # Final spatial-channel attention refinement
-        self.sca_final = SpatialChannelAttention(channels)
-
-        # Output projection
-        self.out_conv = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1),
+        self.out = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
+            nn.GELU(),
         )
 
-    def forward(self, feat_a, feat_b):
-        """
-        Args:
-            feat_a: Features from modality A (B, C, H, W)
-            feat_b: Features from modality B (B, C, H, W)
-        Returns:
-            Fused and refined features (B, C, H, W)
-        """
-        # Step 1: Refine each modality independently
-        feat_a_refined = self.hfrb_a(feat_a)
-        feat_b_refined = self.hfrb_b(feat_b)
+    def forward(self, feat_ir: torch.Tensor, feat_vis: torch.Tensor) -> torch.Tensor:
+        ir_refined = self.hfrb_ir(feat_ir)
+        vis_refined = self.hfrb_vis(feat_vis)
 
-        # Step 2: Generate cross-frequency guidance weights
-        guidance_input = torch.cat([feat_a_refined, feat_b_refined], dim=1)
-        freq_guide_weight = self.freq_guidance(guidance_input)
+        fused = self.hsfb(ir_refined, vis_refined)
+        gate = self.cross_gate(torch.cat([amp_normalize(ir_refined), amp_normalize(vis_refined)], dim=1))
+        return self.out(fused * (1.0 + gate))
 
-        # Step 3: Cross-modal fusion with frequency guidance
-        feat_fused = self.hscffb(feat_a_refined, feat_b_refined)
 
-        # Apply frequency guidance
-        feat_guided = feat_fused * (1.0 + freq_guide_weight)
-
-        # Step 4: Final spatial-channel refinement
-        feat_refined = self.sca_final(feat_guided)
-        out = self.out_conv(feat_refined)
-
-        return out
-
+HSCFFB = HSFB
