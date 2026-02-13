@@ -107,6 +107,7 @@ def build_radial_band_masks(
     height: int,
     width: int,
     num_bands: int = 4,
+    thresholds: List[float] | None = None,
     device: torch.device | None = None,
 ) -> List[torch.Tensor]:
     yy, xx = torch.meshgrid(
@@ -117,7 +118,17 @@ def build_radial_band_masks(
     rr = torch.sqrt(xx ** 2 + yy ** 2)
     rr = rr / (rr.max() + 1e-6)
 
-    boundaries = torch.linspace(0.0, 1.0, num_bands + 1, device=device)
+    if thresholds is None:
+        boundaries = torch.linspace(0.0, 1.0, num_bands + 1, device=device)
+    else:
+        if len(thresholds) != num_bands:
+            raise ValueError(f'thresholds length must equal num_bands ({num_bands})')
+        upper_bounds = torch.tensor(thresholds, dtype=rr.dtype, device=device)
+        if torch.any(upper_bounds <= 0) or torch.any(upper_bounds > 1):
+            raise ValueError('thresholds must be in (0, 1]')
+        if torch.any(upper_bounds[1:] < upper_bounds[:-1]):
+            raise ValueError('thresholds must be non-decreasing')
+        boundaries = torch.cat([torch.tensor([0.0], dtype=rr.dtype, device=device), upper_bounds], dim=0)
     masks: List[torch.Tensor] = []
     for idx in range(num_bands):
         low = boundaries[idx]
@@ -180,4 +191,3 @@ class LearnableHighPass(nn.Module):
 
     def forward(self, x):
         return x - self.blur(x)
-

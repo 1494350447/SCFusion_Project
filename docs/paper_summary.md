@@ -21,12 +21,14 @@
 - `Joint Loss` → `utils/losses.py`
   - `L_total = λ1 * L_ff + λ2 * L_dice + λ3 * L_ce`
   - `L_ff` 基于边缘图 FFT 的多频段频域保真约束
+  - 频段阈值可配置（`band_thresholds`）
 
 ## 训练与数据
 
 - `train.py`
   - 使用 `SCFusionLoss`（联合损失）
   - 支持深监督输出与断点续训
+  - 支持 Adam + StepLR（论文设置）
 
 - `data/rgbt_dataset.py`
   - IR 默认单通道加载（`L`）
@@ -35,4 +37,4 @@
 - `data/transforms.py`
   - IR 单通道归一化，VIS 三通道归一化
   - 保证 mask 判空逻辑稳定
-
+  - 支持论文增强参数（384 裁剪尺寸、翻转概率、旋转角度）

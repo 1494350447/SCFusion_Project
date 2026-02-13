@@ -89,11 +89,11 @@ class DownsamplingLayer(nn.Module):
 
 
 class FREFormerStem(nn.Module):
-    def __init__(self, in_ch: int, base_ch: int):
+    def __init__(self, in_ch: int, stem_ch: int):
         super().__init__()
         self.proj = nn.Sequential(
-            nn.Conv2d(in_ch, base_ch, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(base_ch),
+            nn.Conv2d(in_ch, stem_ch, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(stem_ch),
             nn.GELU(),
         )
 
@@ -102,15 +102,18 @@ class FREFormerStem(nn.Module):
 
 
 class FREFormerBackbone(nn.Module):
-    def __init__(self, base_ch: int = 32, num_blocks_per_stage=(2, 2, 2, 2)):
+    def __init__(
+        self,
+        stem_ch: int = 32,
+        stage_channels=(32, 64, 128, 256),
+        num_blocks_per_stage=(2, 2, 2, 2),
+    ):
         super().__init__()
-        c0 = base_ch
-        c1 = base_ch * 2
-        c2 = base_ch * 4
-        c3 = base_ch * 8
-        channels = [c0, c1, c2, c3]
+        if len(stage_channels) != 4:
+            raise ValueError('stage_channels must contain 4 integers')
+        channels = list(stage_channels)
 
-        in_channels = [base_ch, c0, c1, c2]
+        in_channels = [stem_ch, channels[0], channels[1], channels[2]]
         self.downsamples = nn.ModuleList(
             [DownsamplingLayer(in_c, out_c) for in_c, out_c in zip(in_channels, channels)]
         )
@@ -131,12 +134,23 @@ class FREFormerBackbone(nn.Module):
 
 
 class FREFormerEncoder(nn.Module):
-    def __init__(self, in_ch=3, base_ch=32, num_blocks_per_stage=(2, 2, 2, 2)):
+    def __init__(
+        self,
+        in_ch=3,
+        stage_channels=(32, 64, 128, 256),
+        stem_ch=None,
+        num_blocks_per_stage=(2, 2, 2, 2),
+    ):
         super().__init__()
-        self.stem = FREFormerStem(in_ch, base_ch)
-        self.backbone = FREFormerBackbone(base_ch=base_ch, num_blocks_per_stage=num_blocks_per_stage)
+        stage_channels = tuple(stage_channels)
+        stem_channels = int(stage_channels[0] if stem_ch is None else stem_ch)
+        self.stem = FREFormerStem(in_ch, stem_channels)
+        self.backbone = FREFormerBackbone(
+            stem_ch=stem_channels,
+            stage_channels=stage_channels,
+            num_blocks_per_stage=num_blocks_per_stage,
+        )
 
     def forward(self, x: torch.Tensor):
         x = self.stem(x)
         return self.backbone(x)
-

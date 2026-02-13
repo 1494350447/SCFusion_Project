@@ -5,21 +5,23 @@ import torch
 
 
 class PairedTransforms:
-    def __init__(self, size=(256,256), is_train=True):
+    def __init__(self, size=(256,256), is_train=True, hflip_prob=0.5, rotation_deg=15):
         self.size = size
         self.is_train = is_train
+        self.hflip_prob = hflip_prob
+        self.rotation_deg = rotation_deg
 
     def __call__(self, img_ir, img_vis, mask=None):
         # img_ir, img_vis: PIL Images; mask: PIL Image or None
         # random flip
-        if self.is_train and random.random() > 0.5:
+        if self.is_train and random.random() < self.hflip_prob:
             img_ir = TF.hflip(img_ir)
             img_vis = TF.hflip(img_vis)
             if mask is not None:
                 mask = TF.hflip(mask)
         # random rotation
-        if self.is_train and random.random() > 0.7:
-            angle = random.uniform(-15,15)
+        if self.is_train and self.rotation_deg > 0:
+            angle = random.uniform(-float(self.rotation_deg), float(self.rotation_deg))
             img_ir = TF.rotate(img_ir, angle)
             img_vis = TF.rotate(img_vis, angle)
             if mask is not None:
@@ -47,6 +49,12 @@ class PairedTransforms:
         return t_ir, t_vis
 
 
-def build_transforms(input_size=(256,256), is_train=True):
-    return PairedTransforms(size=input_size, is_train=is_train)
+def build_transforms(input_size=(256,256), is_train=True, augmentation=None):
+    augmentation = augmentation or {}
+    return PairedTransforms(
+        size=augmentation.get('random_crop_size', input_size),
+        is_train=is_train,
+        hflip_prob=augmentation.get('hflip_prob', 0.5),
+        rotation_deg=augmentation.get('rotation_deg', 15),
+    )
 

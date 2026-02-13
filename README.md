@@ -39,13 +39,13 @@ data/
 3. 训练
 
 ```bash
-python train.py --config configs/vt5000_config.py
+python train.py --config configs/vt5000_paper_recommended.py
 ```
 
 4. 测试
 
 ```bash
-python test.py --config configs/vt5000_config.py --ckpt checkpoints/ckpt_epoch_1.pth
+python test.py --config configs/vt5000_paper_recommended.py --ckpt checkpoints/ckpt_epoch_300.pth
 ```
 
 ## 配置
@@ -53,5 +53,6 @@ python test.py --config configs/vt5000_config.py --ckpt checkpoints/ckpt_epoch_1
 可在 `configs/base_config.py` 中修改：
 
 - `model`: 输入通道、基础通道、是否共享编码器、是否深监督、每阶段块数
-- `loss`: 联合损失系数与频段数
-
+- `loss`: 联合损失系数、频段数与频段阈值
+- `optimizer` / `lr_scheduler`: 训练优化器与学习率衰减策略
+- 推荐配置：`configs/vt5000_paper_recommended.py`

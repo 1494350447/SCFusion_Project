@@ -6,9 +6,10 @@ from .basic_layers import build_radial_band_masks
 
 
 class FrequencyReconstructionModule(nn.Module):
-    def __init__(self, channels: int, num_bands: int = 4):
+    def __init__(self, channels: int, num_bands: int = 4, band_thresholds=None):
         super().__init__()
         self.num_bands = num_bands
+        self.band_thresholds = band_thresholds
         self.band_modulators = nn.ModuleList(
             [
                 nn.Sequential(
@@ -31,7 +32,13 @@ class FrequencyReconstructionModule(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
         xf = torch.fft.fft2(x, norm='ortho')
-        band_masks = build_radial_band_masks(h, w, self.num_bands, x.device)
+        band_masks = build_radial_band_masks(
+            h,
+            w,
+            num_bands=self.num_bands,
+            thresholds=self.band_thresholds,
+            device=x.device,
+        )
 
         weights = torch.softmax(self.band_logits, dim=0)
         accum = 0.0
@@ -44,9 +51,13 @@ class FrequencyReconstructionModule(nn.Module):
 
 
 class FRGM(nn.Module):
-    def __init__(self, channels: int, num_bands: int = 4):
+    def __init__(self, channels: int, num_bands: int = 4, band_thresholds=None):
         super().__init__()
-        self.freq_recon = FrequencyReconstructionModule(channels, num_bands=num_bands)
+        self.freq_recon = FrequencyReconstructionModule(
+            channels,
+            num_bands=num_bands,
+            band_thresholds=band_thresholds,
+        )
         self.refine = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
@@ -81,11 +92,22 @@ class DecoderStage(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, in_chs=(32, 64, 128, 256), out_ch: int = 1, deep_supervision: bool = False):
+    def __init__(
+        self,
+        in_chs=(32, 64, 128, 256),
+        out_ch: int = 1,
+        deep_supervision: bool = False,
+        band_thresholds=None,
+    ):
         super().__init__()
         c0, c1, c2, c3 = in_chs
 
-        self.guides = nn.ModuleList([FRGM(c0), FRGM(c1), FRGM(c2), FRGM(c3)])
+        self.guides = nn.ModuleList([
+            FRGM(c0, band_thresholds=band_thresholds),
+            FRGM(c1, band_thresholds=band_thresholds),
+            FRGM(c2, band_thresholds=band_thresholds),
+            FRGM(c3, band_thresholds=band_thresholds),
+        ])
 
         self.stage3 = DecoderStage(c3 * 2, c2)
         self.stage2 = DecoderStage(c2 * 3, c1)
@@ -136,4 +158,3 @@ class Decoder(nn.Module):
             return out, aux1, aux2, aux3
 
         return out
-

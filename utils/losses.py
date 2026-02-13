@@ -34,6 +34,7 @@ def frequency_fidelity_loss(
     target: torch.Tensor,
     band_weights: torch.Tensor,
     num_bands: int = 4,
+    band_thresholds=None,
 ) -> torch.Tensor:
     pred_edge = _sobel_edges(pred_prob)
     target_edge = _sobel_edges(target)
@@ -41,7 +42,13 @@ def frequency_fidelity_loss(
     pred_fft = torch.fft.fft2(pred_edge, norm='ortho')
     target_fft = torch.fft.fft2(target_edge, norm='ortho')
     h, w = pred_prob.shape[-2:]
-    band_masks = build_radial_band_masks(h, w, num_bands=num_bands, device=pred_prob.device)
+    band_masks = build_radial_band_masks(
+        h,
+        w,
+        num_bands=num_bands,
+        thresholds=band_thresholds,
+        device=pred_prob.device,
+    )
     weights = torch.softmax(band_weights, dim=0)
 
     total = 0.0
@@ -54,12 +61,20 @@ def frequency_fidelity_loss(
 
 
 class SCFusionLoss(nn.Module):
-    def __init__(self, lambda_ff: float = 0.6, lambda_dice: float = 0.2, lambda_ce: float = 0.2, num_bands: int = 4):
+    def __init__(
+        self,
+        lambda_ff: float = 0.6,
+        lambda_dice: float = 0.2,
+        lambda_ce: float = 0.2,
+        num_bands: int = 4,
+        band_thresholds=None,
+    ):
         super().__init__()
         self.lambda_ff = lambda_ff
         self.lambda_dice = lambda_dice
         self.lambda_ce = lambda_ce
         self.num_bands = num_bands
+        self.band_thresholds = band_thresholds
         self.ce = nn.BCEWithLogitsLoss()
         self.band_logits = nn.Parameter(torch.zeros(num_bands))
 
@@ -67,7 +82,13 @@ class SCFusionLoss(nn.Module):
         target = target.clamp(0.0, 1.0)
         ce_loss = self.ce(logits, target)
         dice_loss = dice_loss_from_logits(logits, target)
-        ff_loss = frequency_fidelity_loss(torch.sigmoid(logits), target, self.band_logits, self.num_bands)
+        ff_loss = frequency_fidelity_loss(
+            torch.sigmoid(logits),
+            target,
+            self.band_logits,
+            self.num_bands,
+            self.band_thresholds,
+        )
         total = self.lambda_ff * ff_loss + self.lambda_dice * dice_loss + self.lambda_ce * ce_loss
         return total, ce_loss, dice_loss, ff_loss
 
@@ -93,4 +114,3 @@ class SCFusionLoss(nn.Module):
             'loss_ff': ff_loss.detach(),
         }
         return total, metrics
-

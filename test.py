@@ -16,7 +16,7 @@ def load_config(path):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--config', type=str, default='configs/vt5000_config.py')
+    p.add_argument('--config', type=str, default='configs/vt5000_paper_recommended.py')
     p.add_argument('--ckpt', type=str, required=True)
     p.add_argument('--save_dir', type=str, default='test_out')
     return p.parse_args()
