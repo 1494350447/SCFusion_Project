@@ -1,9 +1,13 @@
+import os
 from configs.base_config import cfg as base_cfg
+
+# compute project root path for dataset default
+ROOT = os.path.dirname(os.path.dirname(__file__))
 
 cfg = base_cfg.copy()
 cfg.update({
     'name': 'VT5000_Paper_Recommended',
-    'dataset_root': './data/vt5000',
+    'dataset_root': os.path.join(ROOT, 'VT5000'),
     'batch_size': 8,
     'epochs': 300,
     'lr': 3e-5,
