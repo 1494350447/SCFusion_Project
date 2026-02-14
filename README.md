@@ -318,7 +318,7 @@ python scripts/evaluate_detection_frgm.py \
 5. **类别数**: 确保配置文件中的num_classes与数据集匹配
 6. **FRGM优势**: 相比直接接检测头，FRGM版本保留了频域处理优势，可能获得更好的性能
 
-## 示例：COCO数据集
+## 示例
 
 ```python
 # configs/detectinfig.py
