@@ -132,12 +132,11 @@ python3 scripts/inference.py --ckpt checkpoints/vt5000_run/ckpt_epoch_1.pth --in
 - **多尺度融合**: d0-d3提供了4个尺度的精炼特征
 
 ### 3. **科学性论证**
-这种"FRGM解码器 + 检测头"的架构是科学的：
 - FRGM解码器原本用于显著性检测，其中间特征包含了丰富的语义和空间信息
 - 检测任务同样需要多尺度特征和空间细节
 - FRGM的频域重建能力可以增强特征表示，有利于检测
 
-## 新增文件说明
+## 文件说明
 
 ### 模型文件
 - **`models/detection_head.py`**: YOLOv8风格的检测头实现
