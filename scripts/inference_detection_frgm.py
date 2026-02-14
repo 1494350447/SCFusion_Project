@@ -1,6 +1,6 @@
 """
-Inference script for SCFusion-Det (Object Detection)
-Performs detection on IR-VIS image pairs and visualizes results
+Inference script for SCFusion-Det with FRGM Decoder
+使用FRGM解码器 + 检测头的架构进行推理
 """
 import os
 import sys
@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 import cv2
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from models.scfusion_det import SCFusionDet
+from models.scfusion_det_with_frgm import SCFusionDetWithFRGM
 from utils.detection_metrics import multiclass_nms
 
 
@@ -58,23 +58,7 @@ def preprocess_image(img_path, is_ir=False, size=(640, 640)):
 
 def postprocess_predictions(boxes, scores, labels, orig_size, input_size,
                             conf_threshold=0.25, nms_threshold=0.45):
-    """
-    Post-process model predictions
-
-    Args:
-        boxes: [N, 4] in xyxy format normalized to input_size
-        scores: [N, num_classes] class probabilities
-        labels: Not used (we get labels from scores)
-        orig_size: (W, H) original image size
-        input_size: (H, W) model input size
-        conf_threshold: Confidence threshold
-        nms_threshold: NMS IoU threshold
-
-    Returns:
-        boxes: [M, 4] in xyxy format scaled to orig_size
-        scores: [M] confidence scores
-        labels: [M] class labels
-    """
+    """Post-process model predictions"""
     # Get class predictions
     if scores.ndim == 2:
         class_scores, class_labels = scores.max(dim=-1)
@@ -105,18 +89,7 @@ def postprocess_predictions(boxes, scores, labels, orig_size, input_size,
 
 def visualize_detections(img_path, boxes, scores, labels, class_names=None,
                         output_path=None, conf_threshold=0.25):
-    """
-    Visualize detection results on image
-
-    Args:
-        img_path: Path to original image
-        boxes: [N, 4] in xyxy format
-        scores: [N] confidence scores
-        labels: [N] class labels
-        class_names: List of class names
-        output_path: Where to save visualization
-        conf_threshold: Only show detections above this threshold
-    """
+    """Visualize detection results on image"""
     img = Image.open(img_path).convert('RGB')
     draw = ImageDraw.Draw(img)
 
@@ -161,12 +134,12 @@ def visualize_detections(img_path, boxes, scores, labels, class_names=None,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='configs/detection_config.py')
+    parser.add_argument('--config', default='configs/detection_frgm_config.py')
     parser.add_argument('--ckpt', required=True, help='Path to checkpoint')
     parser.add_argument('--ir', default=None, help='Path to IR image')
     parser.add_argument('--vis', default=None, help='Path to VIS image')
     parser.add_argument('--input_dir', default=None, help='Directory with RGB/ and T/ folders')
-    parser.add_argument('--out_dir', default='detection_results', help='Output directory')
+    parser.add_argument('--out_dir', default='detection_results_frgm', help='Output directory')
     parser.add_argument('--conf_threshold', type=float, default=0.25, help='Confidence threshold')
     parser.add_argument('--nms_threshold', type=float, default=0.45, help='NMS IoU threshold')
     parser.add_argument('--device', default=None)
@@ -184,7 +157,8 @@ def main():
             class_names = [line.strip() for line in f]
 
     # Load model
-    model = SCFusionDet(**cfg.get('model', {})).to(device)
+    print("Loading SCFusionDetWithFRGM (FRGM Decoder + Detection Head)...")
+    model = SCFusionDetWithFRGM(**cfg.get('model', {})).to(device)
     load_checkpoint(model, args.ckpt, device)
     model.eval()
 

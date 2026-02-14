@@ -1,5 +1,6 @@
 """
-Training script for SCFusion-Det (Object Detection)
+Training script for SCFusion-Det with FRGM Decoder
+使用FRGM解码器 + 检测头的架构进行训练
 """
 import argparse
 import importlib.util
@@ -22,15 +23,16 @@ def load_config(path):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/detection_config.py')
+    parser.add_argument('--config', type=str, default='configs/detection_frgm_config.py')
     parser.add_argument('--resume', type=str, default=None)
-    parser.add_argument('--save_dir', type=str, default='checkpoints_det')
+    parser.add_argument('--save_dir', type=str, default='checkpoints_det_frgm')
     return parser.parse_args()
 
 
 def _build_model(cfg, device):
     model_cfg = cfg.get('model', {})
-    model = __import__('models.scfusion_det', fromlist=['SCFusionDet']).SCFusionDet(**model_cfg).to(device)
+    # 使用带FRGM解码器的模型
+    model = __import__('models.scfusion_det_with_frgm', fromlist=['SCFusionDetWithFRGM']).SCFusionDetWithFRGM(**model_cfg).to(device)
     return model
 
 
@@ -91,7 +93,7 @@ def main():
     args = parse_args()
     cfg = load_config(args.config)
     os.makedirs(args.save_dir, exist_ok=True)
-    logger = get_logger('train_det', log_file=os.path.join(args.save_dir, 'train.log'))
+    logger = get_logger('train_det_frgm', log_file=os.path.join(args.save_dir, 'train.log'))
 
     device = cfg.get('device', 'cpu')
 
@@ -115,10 +117,11 @@ def main():
         shuffle=True,
         num_workers=cfg['num_workers'],
         pin_memory=(device != 'cpu'),
-        collate_fn=None,  # Use default collate
+        collate_fn=None,
     )
 
     logger.info(f"Dataset loaded: {len(dataset)} samples, {dataset.num_classes} classes")
+    logger.info("Using SCFusionDetWithFRGM (FRGM Decoder + Detection Head)")
 
     # Build model and loss
     net = _build_model(cfg, device)

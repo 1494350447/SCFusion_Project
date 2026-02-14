@@ -1,15 +1,16 @@
 """
-Configuration for SCFusion-Det (Object Detection)
+Configuration for SCFusion-Det with FRGM Decoder
+使用FRGM解码器 + 检测头的架构
 """
 
 cfg = {
     # Dataset
-    'dataset_root': 'path/to/your/detection/dataset',  # Update this path
+    'dataset_root': 'path/to/your/detection/dataset',  # 修改为你的数据集路径
     'annotation_format': 'coco',  # 'coco' or 'yolo'
     'input_size': (640, 640),  # Input image size (H, W)
     'max_objects': 100,  # Maximum objects per image
 
-    # Model
+    # Model - 使用带FRGM解码器的版本
     'model': {
         'num_classes': 80,  # Number of object classes (80 for COCO)
         'in_ch_ir': 1,
@@ -18,8 +19,10 @@ cfg = {
         'stage_channels': (32, 64, 128, 256),
         'share_encoder': True,
         'num_blocks_per_stage': (2, 2, 2, 2),
+        'frgm_band_thresholds': None,  # FRGM频段阈值，None使用默认
         'reg_max': 16,  # DFL regression max
         'use_fpn': False,  # Whether to use FPN
+        'return_decoder_features': True,  # 使用解码器中间特征
     },
 
     # Loss

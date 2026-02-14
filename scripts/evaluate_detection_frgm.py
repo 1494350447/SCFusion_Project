@@ -1,6 +1,6 @@
 """
-Evaluation script for SCFusion-Det (Object Detection)
-Computes mAP and other detection metrics on test set
+Evaluation script for SCFusion-Det with FRGM Decoder
+使用FRGM解码器 + 检测头的架构进行评估
 """
 import os
 import sys
@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from data.detection_dataset import RGBTDetectionDataset, build_detection_transforms
-from models.scfusion_det import SCFusionDet
+from models.scfusion_det_with_frgm import SCFusionDetWithFRGM
 from utils.detection_metrics import compute_map_at_iou_thresholds, multiclass_nms
 
 
@@ -34,7 +34,7 @@ def load_checkpoint(model, ckpt_path, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='configs/detection_config.py')
+    parser.add_argument('--config', default='configs/detection_frgm_config.py')
     parser.add_argument('--ckpt', required=True, help='Path to checkpoint')
     parser.add_argument('--split', default='test', help='Dataset split to evaluate')
     parser.add_argument('--batch_size', type=int, default=4)
@@ -67,9 +67,10 @@ def main():
     )
 
     print(f"Dataset loaded: {len(dataset)} samples, {dataset.num_classes} classes")
+    print("Using SCFusionDetWithFRGM (FRGM Decoder + Detection Head)")
 
     # Load model
-    model = SCFusionDet(**cfg.get('model', {})).to(device)
+    model = SCFusionDetWithFRGM(**cfg.get('model', {})).to(device)
     load_checkpoint(model, args.ckpt, device)
     model.eval()
 
@@ -115,7 +116,7 @@ def main():
                     score_threshold=args.conf_threshold
                 )
 
-                # Scale boxes to [0, 1] range (assuming they're in pixel coordinates)
+                # Scale boxes to [0, 1] range
                 h, w = cfg['input_size']
                 boxes[:, [0, 2]] /= w
                 boxes[:, [1, 3]] /= h
@@ -153,7 +154,7 @@ def main():
 
     # Print results
     print("\n" + "="*50)
-    print("Evaluation Results:")
+    print("Evaluation Results (FRGM Decoder + Detection Head):")
     print("="*50)
     print(f"mAP@0.5      : {metrics['mAP@0.5']:.4f}")
     print(f"mAP@0.75     : {metrics['mAP@0.75']:.4f}")
@@ -161,9 +162,9 @@ def main():
     print("="*50)
 
     # Save results
-    results_file = os.path.join(os.path.dirname(args.ckpt), 'eval_results.txt')
+    results_file = os.path.join(os.path.dirname(args.ckpt), 'eval_results_frgm.txt')
     with open(results_file, 'w') as f:
-        f.write("Evaluation Results\n")
+        f.write("Evaluation Results (FRGM Decoder + Detection Head)\n")
         f.write("="*50 + "\n")
         f.write(f"Checkpoint: {args.ckpt}\n")
         f.write(f"Dataset: {cfg['dataset_root']}\n")

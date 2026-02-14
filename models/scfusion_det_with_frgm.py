@@ -1,23 +1,28 @@
 """
-SCFusion Detection Model
-Combines SCFusion's encoder-fusion architecture with YOLOv8 detection head
-for general object detection tasks (bounding box predictions)
+SCFusion Detection Model with FRGM Decoder
+Combines SCFusion's encoder-fusion-FRGM decoder with YOLOv8 detection head
+Architecture: Encoder → Fusion → FRGM Decoder → Detection Head
 """
 import torch.nn as nn
 
 from .freformer import FREFormerBackbone, FREFormerEncoder, FREFormerStem
 from .fusion_modules import CFGIM
+from .decoder_modules import Decoder
 from .detection_head import SCFusionDetectionHead
 
 
-class SCFusionDet(nn.Module):
+class SCFusionDetWithFRGM(nn.Module):
     """
-    SCFusion for Object Detection
+    SCFusion for Object Detection with FRGM Decoder
 
     Architecture:
-    1. Dual-stream encoder (IR + VIS) - reuses FREFormer
-    2. Multi-scale fusion with CFGIM - reuses fusion modules
-    3. YOLOv8-style detection head - NEW
+    1. Dual-stream encoder (IR + VIS) - FREFormer
+    2. Multi-scale fusion - CFGIM
+    3. FRGM Decoder - Frequency reconstruction guided decoding
+    4. YOLOv8-style detection head - Object detection
+
+    This architecture preserves the frequency-domain advantages of FRGM decoder
+    while enabling object detection through the detection head.
 
     Args:
         num_classes: Number of object classes (e.g., 80 for COCO)
@@ -27,8 +32,10 @@ class SCFusionDet(nn.Module):
         stage_channels: Channel dimensions for 4 stages
         share_encoder: Whether to share encoder backbone
         num_blocks_per_stage: Number of FREFormer blocks per stage
+        frgm_band_thresholds: Band thresholds for FRGM
         reg_max: DFL regression max value (YOLOv8 parameter)
         use_fpn: Whether to use FPN-like feature fusion before detection
+        return_decoder_features: If True, use decoder intermediate features for detection
     """
     def __init__(
         self,
@@ -39,12 +46,15 @@ class SCFusionDet(nn.Module):
         stage_channels=None,
         share_encoder: bool = True,
         num_blocks_per_stage=(2, 2, 2, 2),
+        frgm_band_thresholds=None,
         reg_max=16,
         use_fpn=False,
+        return_decoder_features=True,
     ):
         super().__init__()
         self.share_encoder = share_encoder
         self.num_classes = num_classes
+        self.return_decoder_features = return_decoder_features
 
         if stage_channels is None:
             stage_channels = (base_ch, base_ch * 2, base_ch * 4, base_ch * 8)
@@ -84,10 +94,20 @@ class SCFusionDet(nn.Module):
         self.cfgim2 = CFGIM(c2)
         self.cfgim3 = CFGIM(c3)
 
+        # ========== FRGM Decoder (Reused from SCFusion) ==========
+        self.decoder = DecoderWithIntermediateFeatures(
+            in_chs=(c0, c1, c2, c3),
+            out_ch=1,
+            deep_supervision=False,
+            band_thresholds=frgm_band_thresholds,
+        )
+
         # ========== Detection Head (NEW) ==========
+        # Use decoder intermediate features (d0, d1, d2, d3) for detection
+        # These features have been refined by FRGM
         self.detection_head = SCFusionDetectionHead(
             num_classes=num_classes,
-            in_channels=stage_channels,
+            in_channels=stage_channels,  # Same as decoder intermediate channels
             reg_max=reg_max,
             use_fpn=use_fpn,
         )
@@ -123,51 +143,75 @@ class SCFusionDet(nn.Module):
         f2 = self.cfgim2(ir_feats[2], vis_feats[2])
         f3 = self.cfgim3(ir_feats[3], vis_feats[3])
 
-        # Detection head
-        return self.detection_head([f0, f1, f2, f3])
+        # FRGM Decoder - get intermediate features
+        decoder_feats = self.decoder([f0, f1, f2, f3])
+        # decoder_feats: [d0, d1, d2, d3] - multi-scale refined features
+
+        # Detection head on decoder features
+        return self.detection_head(decoder_feats)
 
 
-class SCFusionDetWithBackbone(nn.Module):
+class DecoderWithIntermediateFeatures(nn.Module):
     """
-    Alternative version: Use only one modality with detection head
-    Useful for ablation studies or single-modality detection
+    Modified Decoder that returns intermediate features for detection
+    Instead of returning final saliency map, returns [d0, d1, d2, d3]
     """
     def __init__(
         self,
-        num_classes=80,
-        in_ch: int = 3,
-        base_ch: int = 32,
-        stage_channels=None,
-        num_blocks_per_stage=(2, 2, 2, 2),
-        reg_max=16,
-        use_fpn=False,
+        in_chs=(32, 64, 128, 256),
+        out_ch: int = 1,
+        deep_supervision: bool = False,
+        band_thresholds=None,
     ):
         super().__init__()
+        from .decoder_modules import FRGM, DecoderStage
+        import torch.nn.functional as F
 
-        if stage_channels is None:
-            stage_channels = (base_ch, base_ch * 2, base_ch * 4, base_ch * 8)
+        c0, c1, c2, c3 = in_chs
 
-        # Single encoder
-        self.encoder = FREFormerEncoder(
-            in_ch=in_ch,
-            stage_channels=stage_channels,
-            num_blocks_per_stage=num_blocks_per_stage,
-        )
+        self.guides = nn.ModuleList([
+            FRGM(c0, band_thresholds=band_thresholds),
+            FRGM(c1, band_thresholds=band_thresholds),
+            FRGM(c2, band_thresholds=band_thresholds),
+            FRGM(c3, band_thresholds=band_thresholds),
+        ])
 
-        # Detection head
-        self.detection_head = SCFusionDetectionHead(
-            num_classes=num_classes,
-            in_channels=stage_channels,
-            reg_max=reg_max,
-            use_fpn=use_fpn,
-        )
+        self.stage3 = DecoderStage(c3 * 2, c2)
+        self.stage2 = DecoderStage(c2 * 3, c1)
+        self.stage1 = DecoderStage(c1 * 3, c0)
+        self.stage0 = DecoderStage(c0 * 3, c0)
 
-    def forward(self, x):
+    def forward(self, feats):
         """
         Args:
-            x: Input images [B, C, H, W]
+            feats: [f0, f1, f2, f3] from fusion modules
+
         Returns:
-            Detection outputs
+            [d0, d1, d2, d3]: Intermediate decoder features for detection
         """
-        feats = self.encoder(x)
-        return self.detection_head(feats)
+        import torch
+        import torch.nn.functional as F
+
+        f0, f1, f2, f3 = feats
+
+        # Apply FRGM guides
+        g0 = self.guides[0](f0)
+        g1 = self.guides[1](f1)
+        g2 = self.guides[2](f2)
+        g3 = self.guides[3](f3)
+
+        # Decoder stages with upsampling
+        d3 = self.stage3(torch.cat([f3, g3], dim=1))
+
+        d3_up = F.interpolate(d3, size=f2.shape[-2:], mode='bilinear', align_corners=False)
+        d2 = self.stage2(torch.cat([d3_up, f2, g2], dim=1))
+
+        d2_up = F.interpolate(d2, size=f1.shape[-2:], mode='bilinear', align_corners=False)
+        d1 = self.stage1(torch.cat([d2_up, f1, g1], dim=1))
+
+        d1_up = F.interpolate(d1, size=f0.shape[-2:], mode='bilinear', align_corners=False)
+        d0 = self.stage0(torch.cat([d1_up, f0, g0], dim=1))
+
+        # Return intermediate features for detection
+        # Note: d0, d1, d2, d3 have channels (c0, c1, c2, c3)
+        return [d0, d1, d2, d3]
